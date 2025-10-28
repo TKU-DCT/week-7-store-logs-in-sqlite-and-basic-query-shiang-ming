@@ -1,71 +1,162 @@
-import psutil
-from datetime import datetime
-import sqlite3
-import os
-import time
-import subprocess
-import platform
+# main.py
+# Week 7 – Store Logs in SQLite
+# Requirements: psutil (pip install psutil)
 
-DB_NAME = "log.db"
+import sqlite3
+import psutil
+import subprocess
+import datetime
+import time
+import platform
+from pathlib import Path
+
+
+DB_PATH = Path("log.db")
+TABLE_NAME = "system_log"
+PING_HOST = "google.com"  # 需要的話可改成你的目標主機
+SAMPLES = 5               # 紀錄次數
+INTERVAL_SEC = 10         # 每次間隔秒數
+
 
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS system_log (
+    """Create SQLite database and table if not exists."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT,
-            cpu REAL,
-            memory REAL,
-            disk REAL,
-            ping_status TEXT,
-            ping_ms REAL
+            timestamp TEXT NOT NULL,
+            cpu REAL NOT NULL,
+            memory REAL NOT NULL,
+            disk REAL NOT NULL,
+            ping_status TEXT NOT NULL
         )
     """)
     conn.commit()
     conn.close()
 
-def get_system_info():
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    cpu = psutil.cpu_percent(interval=1)
-    memory = psutil.virtual_memory().percent
-    disk = psutil.disk_usage('/').percent
-    ping_status, ping_ms = ping_host("8.8.8.8")
-    return (now, cpu, memory, disk, ping_status, ping_ms)
 
-def ping_host(host):
+def ping_status(host: str = PING_HOST, timeout_sec: int = 3) -> str:
+    """
+    Return 'UP' if ping 1 packet succeeds, else 'DOWN'.
+    Cross-platform: Windows uses -n, Unix-like uses -c.
+    """
+    system = platform.system().lower()
+    count_flag = "-n" if system == "windows" else "-c"
+    cmd = ["ping", count_flag, "1", host]
+
     try:
-        param = "-n" if platform.system().lower() == "windows" else "-c"
-        output = subprocess.check_output(["ping", param, "1", host], stderr=subprocess.DEVNULL).decode()
-        ms = parse_ping_time(output)
-        return ("UP", ms)
-    except:
-        return ("DOWN", -1)
+        # 若無 ping 指令、逾時或非 0 return code，皆視為 DOWN
+        subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout_sec,
+            check=True,
+        )
+        return "UP"
+    except Exception:
+        return "DOWN"
 
-def parse_ping_time(output):
-    for line in output.splitlines():
-        if "time=" in line:
-            parts = line.split("time=")
-            if len(parts) > 1:
-                try:
-                    return float(parts[1].split()[0])
-                except ValueError:
-                    return -1
-    return -1
-    
-def insert_log(data):
-    # TODO: Insert one row of system info into SQLite
-    pass
 
-def show_last_entries(limit=5):
-    # TODO: Retrieve and print the last few records from the database
-    pass
+def get_system_info():
+    """Collect timestamp, cpu%, memory%, disk%, and ping status."""
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cpu = psutil.cpu_percent(interval=0.5)  # 輕量取樣以更穩定
+    memory = psutil.virtual_memory().percent
+    disk = psutil.disk_usage("/").percent
+    pstat = ping_status()
+    return (ts, cpu, memory, disk, pstat)
+
+
+def insert_log(entry):
+    """Insert one log row into SQLite."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        f"""INSERT INTO {TABLE_NAME}
+            (timestamp, cpu, memory, disk, ping_status)
+            VALUES (?, ?, ?, ?, ?)""",
+        entry,
+    )
+    conn.commit()
+    conn.close()
+
+
+def show_last_logs(limit: int = 5):
+    """Print the last N rows in reverse chronological order."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        f"""SELECT id, timestamp, cpu, memory, disk, ping_status
+            FROM {TABLE_NAME}
+            ORDER BY id DESC
+            LIMIT ?""",
+        (limit,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    print("\n=== Last", limit, "entries ===")
+    if not rows:
+        print("(No data)")
+        return
+
+    for r in rows:
+        _id, ts, cpu, mem, disk, pstat = r
+        print(
+            f"#{_id:>4} | {ts} | CPU {cpu:5.1f}% | MEM {mem:5.1f}% | "
+            f"DISK {disk:5.1f}% | PING {pstat}"
+        )
+
+
+def show_failed_pings():
+    """Bonus: show rows where ping failed."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        f"""SELECT id, timestamp, cpu, memory, disk, ping_status
+            FROM {TABLE_NAME}
+            WHERE ping_status = 'DOWN'
+            ORDER BY id DESC"""
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    print("\n=== Failed pings (DOWN) ===")
+    if not rows:
+        print("(None)")
+        return
+    for r in rows:
+        _id, ts, cpu, mem, disk, pstat = r
+        print(
+            f"#{_id:>4} | {ts} | CPU {cpu:5.1f}% | MEM {mem:5.1f}% | "
+            f"DISK {disk:5.1f}% | PING {pstat}"
+        )
+
+
+def main():
+    print("Initializing database...")
+    init_db()
+
+    print(f"Collecting {SAMPLES} samples every {INTERVAL_SEC} seconds...")
+    for i in range(SAMPLES):
+        entry = get_system_info()
+        insert_log(entry)
+        print(
+            f"[{i+1}/{SAMPLES}] Logged at {entry[0]} | "
+            f"CPU {entry[1]:.1f}% MEM {entry[2]:.1f}% DISK {entry[3]:.1f}% PING {entry[4]}"
+        )
+        if i < SAMPLES - 1:
+            time.sleep(INTERVAL_SEC)
+
+    show_last_logs(limit=5)
+    # Bonus（需要就解除註解）
+    # show_failed_pings()
+
 
 if __name__ == "__main__":
-    init_db()
-    for _ in range(5):
-        row = get_system_info()
-        insert_log(row)
-        print("Logged:", row)
-        time.sleep(10)
-    show_last_entries()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted by user. Exiting…")
